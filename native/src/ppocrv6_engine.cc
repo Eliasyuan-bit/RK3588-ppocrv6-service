@@ -168,7 +168,12 @@ cv::Mat ResizePadRgb(const cv::Mat& rgb, int height, int width, float* scale_out
 // Det/Cls letterbox path above, never shrink a long text line merely to make it
 // fit the 320-pixel recognition width: resize to 48 pixels high first, then
 // split the normalized strip into overlapping 320-pixel inputs.
-std::vector<cv::Mat> ResizeForRec(const cv::Mat& bgr, int height, int width) {
+struct RecInputSegment {
+  cv::Mat input;
+  int left = 0;  // Offset in the resized, full-height text strip.
+};
+
+std::vector<RecInputSegment> ResizeForRec(const cv::Mat& bgr, int height, int width) {
   if (bgr.empty() || bgr.type() != CV_8UC3) Fail("Rec input must be BGR uint8");
   const float scale = static_cast<float>(height) / static_cast<float>(bgr.rows);
   const int resized_width = std::max(1, static_cast<int>(std::round(bgr.cols * scale)));
@@ -179,14 +184,14 @@ std::vector<cv::Mat> ResizeForRec(const cv::Mat& bgr, int height, int width) {
     const int copy_width = std::min(width, resized.cols - left);
     cv::Mat input(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
     resized(cv::Rect(left, 0, copy_width, height)).copyTo(input(cv::Rect(0, 0, copy_width, height)));
-    return input;
+    return RecInputSegment{std::move(input), left};
   };
 
   if (resized_width <= width) return {make_input(0)};
 
   constexpr int kOverlapPixels = 32;
   const int stride = width - kOverlapPixels;
-  std::vector<cv::Mat> inputs;
+  std::vector<RecInputSegment> inputs;
   for (int left = 0;;) {
     inputs.push_back(make_input(left));
     if (left + width >= resized_width) break;
@@ -471,75 +476,63 @@ float SoftmaxProbability(const float* logits, int length, int selected) {
   return std::exp(logits[selected] - max_value) / sum;
 }
 
-std::pair<std::string, float> DecodeRec(const std::vector<float>& logits, const rknn_tensor_attr& output,
-                                        const std::vector<std::string>& dictionary) {
+struct RecToken {
+  std::string text;
+  float confidence = 0.0F;
+  int time_step = 0;
+  int time_steps = 0;
+};
+
+std::vector<RecToken> DecodeRecTokens(const std::vector<float>& logits, const rknn_tensor_attr& output,
+                                      const std::vector<std::string>& dictionary) {
   const int channels = output.dims[output.n_dims - 1];
   if (channels != static_cast<int>(dictionary.size()) + 1 || logits.size() % channels != 0) {
     Fail("Rec output channel count does not match ppocrv6_dict.txt: channels=" + std::to_string(channels) +
          ", dictionary=" + std::to_string(dictionary.size()) + ", elements=" + std::to_string(logits.size()));
   }
   const int time_steps = static_cast<int>(logits.size()) / channels;
-  std::string text;
-  float confidence_sum = 0.0F;
-  int confidence_count = 0;
+  std::vector<RecToken> tokens;
   int previous_index = 0;
   for (int time = 0; time < time_steps; ++time) {
     const float* row = logits.data() + time * channels;
     const int index = static_cast<int>(std::max_element(row, row + channels) - row);
     if (index != 0 && index != previous_index) {
-      text += dictionary[index - 1];
-      confidence_sum += SoftmaxProbability(row, channels, index);
-      ++confidence_count;
+      tokens.push_back({dictionary[index - 1], SoftmaxProbability(row, channels, index), time, time_steps});
     }
     previous_index = index;
   }
-  return {text, confidence_count == 0 ? 0.0F : confidence_sum / confidence_count};
+  return tokens;
 }
 
-std::vector<std::string> SplitUtf8(const std::string& text) {
-  std::vector<std::string> characters;
-  for (size_t offset = 0; offset < text.size();) {
-    const unsigned char byte = static_cast<unsigned char>(text[offset]);
-    size_t length = 1;
-    if ((byte & 0xE0U) == 0xC0U) length = 2;
-    else if ((byte & 0xF0U) == 0xE0U) length = 3;
-    else if ((byte & 0xF8U) == 0xF0U) length = 4;
-    if (offset + length > text.size()) length = 1;
-    characters.push_back(text.substr(offset, length));
-    offset += length;
-  }
-  return characters;
-}
-
-std::string MergeRecText(const std::string& left, const std::string& right) {
-  if (left.empty()) return right;
-  if (right.empty()) return left;
-  const auto left_chars = SplitUtf8(left);
-  const auto right_chars = SplitUtf8(right);
-  const size_t max_overlap = std::min(left_chars.size(), right_chars.size());
-  size_t overlap = 0;
-  for (size_t length = max_overlap; length > 0; --length) {
-    if (std::equal(left_chars.end() - length, left_chars.end(), right_chars.begin())) {
-      overlap = length;
-      break;
-    }
-  }
-  std::string merged = left;
-  for (size_t index = overlap; index < right_chars.size(); ++index) merged += right_chars[index];
-  return merged;
-}
-
-std::pair<std::string, float> DecodeRecSegments(const std::vector<cv::Mat>& inputs, const RknnContext& rec,
+std::pair<std::string, float> DecodeRecSegments(const std::vector<RecInputSegment>& inputs, const RknnContext& rec,
                                                  const std::vector<std::string>& dictionary) {
   std::string text;
   float confidence_sum = 0.0F;
   int confidence_count = 0;
-  for (const auto& input : inputs) {
-    const auto decoded = DecodeRec(rec.Run(input), rec.output(), dictionary);
-    if (decoded.first.empty()) continue;
-    text = MergeRecText(text, decoded.first);
-    confidence_sum += decoded.second;
-    ++confidence_count;
+  for (size_t segment_index = 0; segment_index < inputs.size(); ++segment_index) {
+    const auto& segment = inputs[segment_index];
+    const auto tokens = DecodeRecTokens(rec.Run(segment.input), rec.output(), dictionary);
+    // A pair of windows [left, left + 320) overlaps by 32 pixels. Assign the
+    // overlap at its midpoint: the previous window owns its left half, this
+    // window owns its right half. This uses CTC positions rather than matching
+    // potentially imperfect UTF-8 strings from two independent inferences.
+    const float owned_left = segment_index == 0
+                                 ? -std::numeric_limits<float>::infinity()
+                                 : 0.5F * (static_cast<float>(inputs[segment_index - 1].left + rec.width()) +
+                                           static_cast<float>(segment.left));
+    const float owned_right = segment_index + 1 == inputs.size()
+                                  ? std::numeric_limits<float>::infinity()
+                                  : 0.5F * (static_cast<float>(segment.left + rec.width()) +
+                                            static_cast<float>(inputs[segment_index + 1].left));
+    for (const auto& token : tokens) {
+      const float position = static_cast<float>(segment.left) +
+                             (static_cast<float>(token.time_step) + 0.5F) * rec.width() /
+                                 static_cast<float>(token.time_steps);
+      if (position < owned_left || position >= owned_right) continue;
+      text += token.text;
+      confidence_sum += token.confidence;
+      ++confidence_count;
+    }
   }
   return {text, confidence_count == 0 ? 0.0F : confidence_sum / confidence_count};
 }
