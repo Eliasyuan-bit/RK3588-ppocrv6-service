@@ -1,0 +1,18 @@
+# Local configuration and logs
+.env
+*.log
+
+# Generated OCR artifacts
+accuracy_analysis*/
+*.rknn
+*.onnx
+*.npy
+
+# Native build and runtime output
+/build*/
+/native/build*/
+/dist/
+*.jsonl
+result*.json
+
+# Test fixtures are versioned. Models are supplied outside this repository.
