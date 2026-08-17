@@ -14,6 +14,8 @@ struct EngineConfig {
   float det_threshold = 0.30F;
   float det_box_threshold = 0.50F;
   float det_unclip_ratio = 1.60F;
+  int det_tile_size = 960;
+  int det_tile_overlap = 96;
   float rec_score_threshold = 0.50F;
 };
 

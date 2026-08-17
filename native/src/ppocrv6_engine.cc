@@ -219,7 +219,8 @@ struct DetBox {
   float score = 0.0F;
 };
 
-std::vector<DetBox> DecodeDet(const std::vector<float>& logits, int height, int width, const EngineConfig& config, float scale) {
+std::vector<DetBox> DecodeDet(const std::vector<float>& logits, int height, int width, const EngineConfig& config,
+                              float scale, int source_width, int source_height) {
   if (logits.size() != static_cast<size_t>(height * width)) Fail("unexpected Det output shape");
   cv::Mat probability(height, width, CV_32FC1);
   cv::Mat bitmap(height, width, CV_8UC1);
@@ -249,12 +250,105 @@ std::vector<DetBox> DecodeDet(const std::vector<float>& logits, int height, int 
     rect.points(points.data());
     points = OrderQuad(points);
     for (auto& point : points) {
-      point.x = std::clamp(point.x / scale, 0.0F, std::numeric_limits<float>::max());
-      point.y = std::clamp(point.y / scale, 0.0F, std::numeric_limits<float>::max());
+      point.x = std::clamp(point.x / scale, 0.0F, static_cast<float>(source_width - 1));
+      point.y = std::clamp(point.y / scale, 0.0F, static_cast<float>(source_height - 1));
     }
     decoded.push_back({points, score});
   }
   return decoded;
+}
+
+std::vector<int> TileStarts(int extent, int tile_size, int overlap) {
+  if (extent <= tile_size) return {0};
+  const int stride = tile_size - overlap;
+  if (stride <= 0) Fail("Det tile overlap must be smaller than the tile size");
+  std::vector<int> starts;
+  for (int start = 0;;) {
+    starts.push_back(start);
+    if (start + tile_size >= extent) break;
+    const int final_start = extent - tile_size;
+    int next_start = start + stride;
+    if (next_start + tile_size >= extent) next_start = final_start;
+    // Avoid a nearly identical penultimate/final tile. Near the right/bottom
+    // edge it is preferable to reduce the requested overlap slightly instead
+    // of running two windows that differ by only a few pixels.
+    else if (final_start - next_start < overlap) next_start = final_start;
+    if (next_start <= start) break;
+    start = next_start;
+  }
+  return starts;
+}
+
+void OffsetDetBox(DetBox* box, int left, int top) {
+  for (auto& point : box->points) {
+    point.x += left;
+    point.y += top;
+  }
+}
+
+cv::Rect2f DetBounds(const DetBox& box) {
+  float min_x = box.points[0].x;
+  float max_x = min_x;
+  float min_y = box.points[0].y;
+  float max_y = min_y;
+  for (const auto& point : box.points) {
+    min_x = std::min(min_x, point.x);
+    max_x = std::max(max_x, point.x);
+    min_y = std::min(min_y, point.y);
+    max_y = std::max(max_y, point.y);
+  }
+  return {min_x, min_y, std::max(0.0F, max_x - min_x), std::max(0.0F, max_y - min_y)};
+}
+
+float DetIoU(const DetBox& left, const DetBox& right) {
+  const cv::Rect2f a = DetBounds(left);
+  const cv::Rect2f b = DetBounds(right);
+  const float inter_left = std::max(a.x, b.x);
+  const float inter_top = std::max(a.y, b.y);
+  const float inter_right = std::min(a.x + a.width, b.x + b.width);
+  const float inter_bottom = std::min(a.y + a.height, b.y + b.height);
+  const float inter_width = std::max(0.0F, inter_right - inter_left);
+  const float inter_height = std::max(0.0F, inter_bottom - inter_top);
+  const float intersection = inter_width * inter_height;
+  const float union_area = a.width * a.height + b.width * b.height - intersection;
+  return union_area > 0.0F ? intersection / union_area : 0.0F;
+}
+
+std::vector<DetBox> DeduplicateDetBoxes(std::vector<DetBox> boxes) {
+  std::sort(boxes.begin(), boxes.end(), [](const DetBox& left, const DetBox& right) {
+    return left.score > right.score;
+  });
+  std::vector<DetBox> kept;
+  kept.reserve(boxes.size());
+  for (const auto& candidate : boxes) {
+    const bool duplicate = std::any_of(kept.begin(), kept.end(), [&](const DetBox& existing) {
+      return DetIoU(candidate, existing) >= 0.50F;
+    });
+    if (!duplicate) kept.push_back(candidate);
+  }
+  return kept;
+}
+
+std::vector<DetBox> DetectTextBoxes(const cv::Mat& bgr, const RknnContext& det, const EngineConfig& config) {
+  if (config.det_tile_size <= 0 || config.det_tile_overlap < 0) Fail("invalid Det tile configuration");
+  const auto x_starts = TileStarts(bgr.cols, config.det_tile_size, config.det_tile_overlap);
+  const auto y_starts = TileStarts(bgr.rows, config.det_tile_size, config.det_tile_overlap);
+  std::vector<DetBox> boxes;
+  for (const int top : y_starts) {
+    for (const int left : x_starts) {
+      const int tile_width = std::min(config.det_tile_size, bgr.cols - left);
+      const int tile_height = std::min(config.det_tile_size, bgr.rows - top);
+      const cv::Mat tile = bgr(cv::Rect(left, top, tile_width, tile_height));
+      float scale = 1.0F;
+      const cv::Mat input = ResizePadRgb(tile, det.height(), det.width(), &scale);
+      auto tile_boxes = DecodeDet(det.Run(input), det.height(), det.width(), config, scale, tile.cols, tile.rows);
+      for (auto& box : tile_boxes) {
+        OffsetDetBox(&box, left, top);
+        boxes.push_back(std::move(box));
+      }
+    }
+  }
+  return DeduplicateDetBoxes(std::move(boxes));
 }
 
 cv::Mat PerspectiveCrop(const cv::Mat& rgb, std::array<cv::Point2f, 4> box) {
@@ -427,9 +521,7 @@ class OcrEngine::Impl {
     // channel order instead of swapping it before the model input.
     const cv::Mat& rgb = bgr;
 
-    float det_scale = 1.0F;
-    const cv::Mat det_input = ResizePadRgb(rgb, det_all.height(), det_all.width(), &det_scale);
-    std::vector<DetBox> boxes = DecodeDet(det_all.Run(det_input), det_all.height(), det_all.width(), config, det_scale);
+    std::vector<DetBox> boxes = DetectTextBoxes(rgb, det_all, config);
     std::sort(boxes.begin(), boxes.end(), ReadingOrder);
 
     struct CropTask { DetBox box; cv::Mat crop; bool rotated = false; };
