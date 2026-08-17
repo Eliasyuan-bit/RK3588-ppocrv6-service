@@ -483,6 +483,11 @@ struct RecToken {
   int time_steps = 0;
 };
 
+struct PositionedRecToken {
+  RecToken token;
+  size_t segment_index = 0;
+};
+
 std::vector<RecToken> DecodeRecTokens(const std::vector<float>& logits, const rknn_tensor_attr& output,
                                       const std::vector<std::string>& dictionary) {
   const int channels = output.dims[output.n_dims - 1];
@@ -506,9 +511,7 @@ std::vector<RecToken> DecodeRecTokens(const std::vector<float>& logits, const rk
 
 std::pair<std::string, float> DecodeRecSegments(const std::vector<RecInputSegment>& inputs, const RknnContext& rec,
                                                  const std::vector<std::string>& dictionary) {
-  std::string text;
-  float confidence_sum = 0.0F;
-  int confidence_count = 0;
+  std::vector<PositionedRecToken> selected_tokens;
   for (size_t segment_index = 0; segment_index < inputs.size(); ++segment_index) {
     const auto& segment = inputs[segment_index];
     const auto tokens = DecodeRecTokens(rec.Run(segment.input), rec.output(), dictionary);
@@ -529,12 +532,27 @@ std::pair<std::string, float> DecodeRecSegments(const std::vector<RecInputSegmen
                              (static_cast<float>(token.time_step) + 0.5F) * rec.width() /
                                  static_cast<float>(token.time_steps);
       if (position < owned_left || position >= owned_right) continue;
-      text += token.text;
-      confidence_sum += token.confidence;
-      ++confidence_count;
+      // CTC collapsing happens inside each inference. At a window boundary,
+      // one glyph can still be emitted by both independent inferences. Collapse
+      // only an identical adjacent token that comes from a different segment;
+      // ordinary repeated characters within one window are kept unchanged.
+      if (!selected_tokens.empty() && selected_tokens.back().segment_index != segment_index &&
+          selected_tokens.back().token.text == token.text) {
+        if (token.confidence > selected_tokens.back().token.confidence) {
+          selected_tokens.back() = {token, segment_index};
+        }
+        continue;
+      }
+      selected_tokens.push_back({token, segment_index});
     }
   }
-  return {text, confidence_count == 0 ? 0.0F : confidence_sum / confidence_count};
+  std::string text;
+  float confidence_sum = 0.0F;
+  for (const auto& positioned : selected_tokens) {
+    text += positioned.token.text;
+    confidence_sum += positioned.token.confidence;
+  }
+  return {text, selected_tokens.empty() ? 0.0F : confidence_sum / selected_tokens.size()};
 }
 
 bool ShouldRotate180(const std::vector<float>& logits) {
