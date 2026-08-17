@@ -164,6 +164,44 @@ cv::Mat ResizePadRgb(const cv::Mat& rgb, int height, int width, float* scale_out
   return padded;
 }
 
+// PP-OCR recognition expects glyphs to use the full input height.  Unlike the
+// Det/Cls letterbox path above, never shrink a long text line merely to make it
+// fit the 320-pixel recognition width: resize to 48 pixels high first, then
+// split the normalized strip into overlapping 320-pixel inputs.
+std::vector<cv::Mat> ResizeForRec(const cv::Mat& bgr, int height, int width) {
+  if (bgr.empty() || bgr.type() != CV_8UC3) Fail("Rec input must be BGR uint8");
+  const float scale = static_cast<float>(height) / static_cast<float>(bgr.rows);
+  const int resized_width = std::max(1, static_cast<int>(std::round(bgr.cols * scale)));
+  cv::Mat resized;
+  cv::resize(bgr, resized, cv::Size(resized_width, height));
+
+  const auto make_input = [&](int left) {
+    const int copy_width = std::min(width, resized.cols - left);
+    cv::Mat input(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
+    resized(cv::Rect(left, 0, copy_width, height)).copyTo(input(cv::Rect(0, 0, copy_width, height)));
+    return input;
+  };
+
+  if (resized_width <= width) return {make_input(0)};
+
+  constexpr int kOverlapPixels = 32;
+  const int stride = width - kOverlapPixels;
+  std::vector<cv::Mat> inputs;
+  for (int left = 0;;) {
+    inputs.push_back(make_input(left));
+    if (left + width >= resized_width) break;
+
+    const int final_left = resized_width - width;
+    int next_left = left + stride;
+    if (next_left + width >= resized_width) next_left = final_left;
+    // A final shift smaller than the overlap contributes almost no new glyph
+    // pixels. The previous window already covers everything except that tail.
+    if (next_left <= left || final_left - left < kOverlapPixels) break;
+    left = next_left;
+  }
+  return inputs;
+}
+
 float FastBoxScore(const cv::Mat& probability, const std::array<cv::Point2f, 4>& box) {
   std::vector<cv::Point> contour;
   contour.reserve(4);
@@ -289,6 +327,54 @@ std::pair<std::string, float> DecodeRec(const std::vector<float>& logits, const 
   return {text, confidence_count == 0 ? 0.0F : confidence_sum / confidence_count};
 }
 
+std::vector<std::string> SplitUtf8(const std::string& text) {
+  std::vector<std::string> characters;
+  for (size_t offset = 0; offset < text.size();) {
+    const unsigned char byte = static_cast<unsigned char>(text[offset]);
+    size_t length = 1;
+    if ((byte & 0xE0U) == 0xC0U) length = 2;
+    else if ((byte & 0xF0U) == 0xE0U) length = 3;
+    else if ((byte & 0xF8U) == 0xF0U) length = 4;
+    if (offset + length > text.size()) length = 1;
+    characters.push_back(text.substr(offset, length));
+    offset += length;
+  }
+  return characters;
+}
+
+std::string MergeRecText(const std::string& left, const std::string& right) {
+  if (left.empty()) return right;
+  if (right.empty()) return left;
+  const auto left_chars = SplitUtf8(left);
+  const auto right_chars = SplitUtf8(right);
+  const size_t max_overlap = std::min(left_chars.size(), right_chars.size());
+  size_t overlap = 0;
+  for (size_t length = max_overlap; length > 0; --length) {
+    if (std::equal(left_chars.end() - length, left_chars.end(), right_chars.begin())) {
+      overlap = length;
+      break;
+    }
+  }
+  std::string merged = left;
+  for (size_t index = overlap; index < right_chars.size(); ++index) merged += right_chars[index];
+  return merged;
+}
+
+std::pair<std::string, float> DecodeRecSegments(const std::vector<cv::Mat>& inputs, const RknnContext& rec,
+                                                 const std::vector<std::string>& dictionary) {
+  std::string text;
+  float confidence_sum = 0.0F;
+  int confidence_count = 0;
+  for (const auto& input : inputs) {
+    const auto decoded = DecodeRec(rec.Run(input), rec.output(), dictionary);
+    if (decoded.first.empty()) continue;
+    text = MergeRecText(text, decoded.first);
+    confidence_sum += decoded.second;
+    ++confidence_count;
+  }
+  return {text, confidence_count == 0 ? 0.0F : confidence_sum / confidence_count};
+}
+
 bool ShouldRotate180(const std::vector<float>& logits) {
   if (logits.size() != 2) Fail("unexpected Cls output shape");
   const int index = logits[1] > logits[0] ? 1 : 0;
@@ -364,8 +450,9 @@ class OcrEngine::Impl {
     std::vector<TextResult> results;
     results.reserve(tasks.size());
     for (const auto& task : tasks) {
-      const cv::Mat rec_input = ResizePadRgb(task.crop, rec.height(), rec.width());
-      const auto decoded = DecodeRec(rec.Run(rec_input), rec.output(), dictionary);
+      const auto rec_inputs = ResizeForRec(task.crop, rec.height(), rec.width());
+      const auto decoded = DecodeRecSegments(rec_inputs, rec, dictionary);
+      if (decoded.first.empty() || decoded.second < config.rec_score_threshold) continue;
       results.push_back({ToResultBox(task.box.points), task.box.score, decoded.second, task.rotated, decoded.first});
     }
     return results;
