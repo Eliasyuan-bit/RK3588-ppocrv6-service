@@ -286,6 +286,14 @@ void OffsetDetBox(DetBox* box, int left, int top) {
   }
 }
 
+void ClampDetBox(DetBox* box, int source_width, int source_height) {
+  for (auto& point : box->points) {
+    point.x = std::clamp(point.x, 0.0F, static_cast<float>(source_width - 1));
+    point.y = std::clamp(point.y, 0.0F, static_cast<float>(source_height - 1));
+  }
+  box->points = OrderQuad(box->points);
+}
+
 cv::Rect2f DetBounds(const DetBox& box) {
   float min_x = box.points[0].x;
   float max_x = min_x;
@@ -314,19 +322,86 @@ float DetIoU(const DetBox& left, const DetBox& right) {
   return union_area > 0.0F ? intersection / union_area : 0.0F;
 }
 
-std::vector<DetBox> DeduplicateDetBoxes(std::vector<DetBox> boxes) {
+float DetIntersectionArea(const DetBox& left, const DetBox& right) {
+  const cv::Rect2f a = DetBounds(left);
+  const cv::Rect2f b = DetBounds(right);
+  const float width = std::max(0.0F, std::min(a.x + a.width, b.x + b.width) - std::max(a.x, b.x));
+  const float height = std::max(0.0F, std::min(a.y + a.height, b.y + b.height) - std::max(a.y, b.y));
+  return width * height;
+}
+
+float DetContainment(const DetBox& left, const DetBox& right) {
+  const cv::Rect2f a = DetBounds(left);
+  const cv::Rect2f b = DetBounds(right);
+  const float smaller_area = std::min(a.width * a.height, b.width * b.height);
+  return smaller_area > 0.0F ? DetIntersectionArea(left, right) / smaller_area : 0.0F;
+}
+
+bool IsSameDetTextLine(const DetBox& left, const DetBox& right) {
+  const cv::Rect2f a = DetBounds(left);
+  const cv::Rect2f b = DetBounds(right);
+  if (a.height <= 0.0F || b.height <= 0.0F || a.width <= 0.0F || b.width <= 0.0F) return false;
+  const float vertical_overlap = std::max(0.0F, std::min(a.y + a.height, b.y + b.height) - std::max(a.y, b.y));
+  if (vertical_overlap / std::min(a.height, b.height) < 0.70F) return false;
+  const float horizontal_overlap =
+      std::max(0.0F, std::min(a.x + a.width, b.x + b.width) - std::max(a.x, b.x));
+  // Text boxes from adjacent columns normally have a gap. Requiring a material
+  // horizontal overlap restricts stitching to partial boxes produced by two tiles.
+  return horizontal_overlap / std::min(a.width, b.width) >= 0.15F;
+}
+
+DetBox MergeDetBoxes(const DetBox& left, const DetBox& right) {
+  std::vector<cv::Point2f> points;
+  points.reserve(8);
+  points.insert(points.end(), left.points.begin(), left.points.end());
+  points.insert(points.end(), right.points.begin(), right.points.end());
+  const cv::RotatedRect rect = cv::minAreaRect(points);
+  DetBox merged{};
+  rect.points(merged.points.data());
+  merged.points = OrderQuad(merged.points);
+  merged.score = std::max(left.score, right.score);
+  return merged;
+}
+
+std::vector<DetBox> DeduplicateDetBoxes(std::vector<DetBox> boxes, int source_width, int source_height) {
   std::sort(boxes.begin(), boxes.end(), [](const DetBox& left, const DetBox& right) {
     return left.score > right.score;
   });
-  std::vector<DetBox> kept;
-  kept.reserve(boxes.size());
-  for (const auto& candidate : boxes) {
-    const bool duplicate = std::any_of(kept.begin(), kept.end(), [&](const DetBox& existing) {
-      return DetIoU(candidate, existing) >= 0.50F;
-    });
-    if (!duplicate) kept.push_back(candidate);
+
+  // A line crossing the overlap between two Det tiles can produce two partial,
+  // overlapping boxes. Their IoU is often too low for ordinary NMS. Consolidate
+  // them before recognition so Rec sees the complete line exactly once.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::vector<bool> consumed(boxes.size(), false);
+    std::vector<DetBox> consolidated;
+    consolidated.reserve(boxes.size());
+    for (size_t i = 0; i < boxes.size(); ++i) {
+      if (consumed[i]) continue;
+      DetBox current = boxes[i];
+      for (size_t j = i + 1; j < boxes.size(); ++j) {
+        if (consumed[j]) continue;
+        const bool same_line = IsSameDetTextLine(current, boxes[j]);
+        const float containment = same_line ? DetContainment(current, boxes[j]) : 0.0F;
+        if (DetIoU(current, boxes[j]) >= 0.50F || containment >= 0.80F) {
+          const cv::Rect2f current_bounds = DetBounds(current);
+          const cv::Rect2f candidate_bounds = DetBounds(boxes[j]);
+          if (candidate_bounds.area() > current_bounds.area()) current = boxes[j];
+          consumed[j] = true;
+          changed = true;
+        } else if (same_line) {
+          current = MergeDetBoxes(current, boxes[j]);
+          consumed[j] = true;
+          changed = true;
+        }
+      }
+      ClampDetBox(&current, source_width, source_height);
+      consolidated.push_back(std::move(current));
+    }
+    boxes = std::move(consolidated);
   }
-  return kept;
+  return boxes;
 }
 
 std::vector<DetBox> DetectTextBoxes(const cv::Mat& bgr, const RknnContext& det, const EngineConfig& config) {
@@ -348,7 +423,7 @@ std::vector<DetBox> DetectTextBoxes(const cv::Mat& bgr, const RknnContext& det, 
       }
     }
   }
-  return DeduplicateDetBoxes(std::move(boxes));
+  return DeduplicateDetBoxes(std::move(boxes), bgr.cols, bgr.rows);
 }
 
 cv::Mat PerspectiveCrop(const cv::Mat& rgb, std::array<cv::Point2f, 4> box) {
